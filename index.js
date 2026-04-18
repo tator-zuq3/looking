@@ -83,14 +83,35 @@ function parseCSV(csv) {
 let ALL_WALLETS = [];
 let lastLoadTime = null;
 
+function cleanAddress(addr) {
+    // Strip quotes, whitespace, BOM, zero-width chars that Google Sheets may add
+    return String(addr)
+        .replace(/^[\s'""\u200B\uFEFF]+/, '')
+        .replace(/[\s'""\u200B\uFEFF]+$/, '')
+        .trim();
+}
+
 async function loadWallets() {
     try {
         console.log('📥 Fetching wallets from Google Sheet...');
         const csv = await fetchUrl(SHEET_CSV_URL);
-        const wallets = parseCSV(csv);
+        const rawWallets = parseCSV(csv);
+        
+        // Clean addresses
+        const wallets = rawWallets.map(([addr, label]) => [cleanAddress(addr), label]);
+        
         ALL_WALLETS = wallets;
         lastLoadTime = new Date();
-        console.log(`✅ Loaded ${wallets.length} wallets at ${lastLoadTime.toISOString()}`);
+        
+        // Debug: log first 3 entries
+        const evmCount = wallets.filter(([a]) => isEvm(a)).length;
+        const solCount = wallets.filter(([a]) => isSol(a)).length;
+        console.log(`✅ Loaded ${wallets.length} wallets (EVM: ${evmCount}, SOL: ${solCount}) at ${lastLoadTime.toISOString()}`);
+        if (wallets.length > 0) {
+            console.log('📋 Sample entries:');
+            wallets.slice(0, 3).forEach(([a, l]) => console.log(`   [${a.length}] "${a}" → "${l}" (EVM: ${isEvm(a)}, SOL: ${isSol(a)})`));
+        }
+        
         return wallets.length;
     } catch (e) {
         console.error('❌ Failed to load wallets:', e.message);
