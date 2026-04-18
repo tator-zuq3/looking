@@ -1,57 +1,102 @@
 const TelegramBot = require('node-telegram-bot-api');
+const https = require('https');
+const http = require('http');
 
 // ===================== CONFIG =====================
 const BOT_TOKEN = process.env.BOT_TOKEN;
+const SHEET_CSV_URL = process.env.SHEET_CSV_URL; // Published Google Sheet CSV URL
 const ALLOWED_USERS = (process.env.ALLOWED_USERS || '').split(',').map(s => s.trim()).filter(Boolean);
 
-if (!BOT_TOKEN) {
-    console.error('❌ BOT_TOKEN is required');
-    process.exit(1);
+if (!BOT_TOKEN) { console.error('❌ BOT_TOKEN is required'); process.exit(1); }
+if (!SHEET_CSV_URL) { console.error('❌ SHEET_CSV_URL is required'); process.exit(1); }
+
+// ===================== CSV FETCH & PARSE =====================
+function fetchUrl(url) {
+    return new Promise((resolve, reject) => {
+        const client = url.startsWith('https') ? https : http;
+        const req = client.get(url, { headers: { 'User-Agent': 'WalletBot/1.0' } }, (res) => {
+            // Follow redirects
+            if (res.statusCode >= 300 && res.statusCode < 400 && res.headers.location) {
+                return fetchUrl(res.headers.location).then(resolve).catch(reject);
+            }
+            if (res.statusCode !== 200) {
+                return reject(new Error(`HTTP ${res.statusCode}`));
+            }
+            let data = '';
+            res.on('data', chunk => data += chunk);
+            res.on('end', () => resolve(data));
+        });
+        req.on('error', reject);
+        req.setTimeout(15000, () => { req.destroy(); reject(new Error('Timeout')); });
+    });
 }
 
-// ===================== LOAD WALLETS =====================
-function loadWallets() {
-    let raw = [];
-    let custom = [];
+function parseCSV(csv) {
+    const wallets = [];
+    const lines = csv.split('\n');
 
-    // WALLETS_RAW: JSON array of [address, label] pairs
-    // Supports splitting: WALLETS_RAW, WALLETS_RAW_2, WALLETS_RAW_3, ...
-    try {
-        const parts = [];
-        if (process.env.WALLETS_RAW) parts.push(process.env.WALLETS_RAW);
-        for (let i = 2; i <= 10; i++) {
-            const key = `WALLETS_RAW_${i}`;
-            if (process.env[key]) parts.push(process.env[key]);
-        }
-        if (parts.length > 0) {
-            // Each part is a JSON array string, merge them
-            for (const part of parts) {
-                const parsed = JSON.parse(part);
-                if (Array.isArray(parsed)) raw.push(...parsed);
+    for (let i = 0; i < lines.length; i++) {
+        const line = lines[i].trim();
+        if (!line) continue;
+
+        // Parse CSV line (handles quoted fields)
+        const fields = [];
+        let current = '';
+        let inQuotes = false;
+
+        for (let j = 0; j < line.length; j++) {
+            const ch = line[j];
+            if (ch === '"') {
+                if (inQuotes && line[j + 1] === '"') {
+                    current += '"';
+                    j++;
+                } else {
+                    inQuotes = !inQuotes;
+                }
+            } else if (ch === ',' && !inQuotes) {
+                fields.push(current.trim());
+                current = '';
+            } else {
+                current += ch;
             }
         }
-    } catch (e) {
-        console.error('⚠️ Error parsing WALLETS_RAW:', e.message);
+        fields.push(current.trim());
+
+        if (fields.length < 2) continue;
+
+        const address = fields[0].trim();
+        const label = fields[1].trim();
+
+        // Skip header row
+        if (i === 0 && (address.toLowerCase() === 'address' || address.toLowerCase() === 'wallet')) continue;
+
+        // Skip empty or invalid
+        if (!address || !label) continue;
+
+        wallets.push([address, label]);
     }
 
-    // WALLETS_CUSTOM: JSON array of [address, label] pairs
-    try {
-        if (process.env.WALLETS_CUSTOM) {
-            const parsed = JSON.parse(process.env.WALLETS_CUSTOM);
-            if (Array.isArray(parsed)) custom = parsed;
-        }
-    } catch (e) {
-        console.error('⚠️ Error parsing WALLETS_CUSTOM:', e.message);
-    }
-
-    console.log(`📦 Loaded ${raw.length} raw + ${custom.length} custom = ${raw.length + custom.length} wallets`);
-    return { raw, custom };
+    return wallets;
 }
 
-const { raw: rawWallets, custom: customWallets } = loadWallets();
+// ===================== WALLET STORE =====================
+let ALL_WALLETS = [];
+let lastLoadTime = null;
 
-// Merged list: custom first (higher priority), then raw
-const ALL_WALLETS = [...customWallets, ...rawWallets];
+async function loadWallets() {
+    try {
+        console.log('📥 Fetching wallets from Google Sheet...');
+        const csv = await fetchUrl(SHEET_CSV_URL);
+        const wallets = parseCSV(csv);
+        ALL_WALLETS = wallets;
+        lastLoadTime = new Date();
+        console.log(`✅ Loaded ${wallets.length} wallets at ${lastLoadTime.toISOString()}`);
+        return wallets.length;
+    } catch (e) {
+        console.error('❌ Failed to load wallets:', e.message);
+        throw e;
+    }
+}
 
 // ===================== HELPERS =====================
 function isEvm(addr) {
@@ -85,10 +130,8 @@ function searchWallets(query) {
         const addrLow = String(addr).toLowerCase();
         const labelLow = String(label).toLowerCase();
 
-        // Deduplicate by address
         if (seen.has(addrLow)) continue;
 
-        // Match: address contains query OR label contains query
         if (addrLow.includes(q) || labelLow.includes(q)) {
             seen.add(addrLow);
             results.push({ address: String(addr), label: String(label) });
@@ -98,7 +141,6 @@ function searchWallets(query) {
     return results;
 }
 
-// Exact address lookup (prioritize exact match)
 function lookupAddress(addr) {
     const q = addr.trim().toLowerCase();
     for (const [a, label] of ALL_WALLETS) {
@@ -112,12 +154,12 @@ function lookupAddress(addr) {
 // ===================== FORMAT =====================
 function formatResults(query, results) {
     if (results.length === 0) {
-        return `🔍 "<b>${escapeHtml(query)}</b>" — không tìm thấy kết quả nào.`;
+        return `🔍 "<b>${escapeHtml(query)}</b>" — không tìm thấy.`;
     }
 
     const header = `🔍 "<b>${escapeHtml(query)}</b>" — ${results.length}${results.length >= MAX_RESULTS ? '+' : ''} kết quả:\n`;
 
-    const lines = results.map((r, i) => {
+    const lines = results.map((r) => {
         const tag = isEvm(r.address) ? '🔵' : isSol(r.address) ? '🟣' : '⚪';
         return `\n${tag} <b>${escapeHtml(r.label)}</b>\n<code>${escapeHtml(r.address)}</code>`;
     });
@@ -133,9 +175,8 @@ function formatExactMatch(result) {
 // ===================== TELEGRAM BOT =====================
 const bot = new TelegramBot(BOT_TOKEN, { polling: true });
 
-// Auth check
 function isAllowed(msg) {
-    if (ALLOWED_USERS.length === 0) return true; // no restriction
+    if (ALLOWED_USERS.length === 0) return true;
     const userId = String(msg.from?.id || '');
     const username = String(msg.from?.username || '').toLowerCase();
     return ALLOWED_USERS.includes(userId) || ALLOWED_USERS.includes(username);
@@ -154,14 +195,16 @@ bot.onText(/\/start/, (msg) => {
         '',
         '📌 Cách dùng:',
         '• Paste <b>address</b> → tra label',
-        '• Gõ <b>text</b> → search wallets có label chứa text đó',
+        '• Gõ <b>text</b> → search label',
         '',
         '📋 Commands:',
         '/search &lt;query&gt; — tìm kiếm',
-        '/stats — thống kê số wallets',
+        '/stats — thống kê',
+        '/reload — refresh data từ Google Sheet',
         '',
         `📦 Loaded: <b>${ALL_WALLETS.length}</b> wallets`,
-    ].join('\n');
+        lastLoadTime ? `🕐 Last load: ${lastLoadTime.toLocaleString('vi-VN')}` : '',
+    ].filter(Boolean).join('\n');
 
     bot.sendMessage(msg.chat.id, text, { parse_mode: 'HTML' });
 });
@@ -173,8 +216,6 @@ bot.onText(/\/stats/, (msg) => {
     const evmCount = ALL_WALLETS.filter(([a]) => isEvm(a)).length;
     const solCount = ALL_WALLETS.filter(([a]) => isSol(a)).length;
     const otherCount = ALL_WALLETS.length - evmCount - solCount;
-
-    // Count unique addresses
     const unique = new Set(ALL_WALLETS.map(([a]) => String(a).toLowerCase()));
 
     const text = [
@@ -186,11 +227,32 @@ bot.onText(/\/stats/, (msg) => {
         `├ 🟣 SOL: <b>${solCount}</b>`,
         `└ ⚪ Other: <b>${otherCount}</b>`,
         '',
-        `Raw: <b>${rawWallets.length}</b>`,
-        `Custom: <b>${customWallets.length}</b>`,
-    ].join('\n');
+        lastLoadTime ? `🕐 Last load: ${lastLoadTime.toLocaleString('vi-VN')}` : '',
+    ].filter(Boolean).join('\n');
 
     bot.sendMessage(msg.chat.id, text, { parse_mode: 'HTML' });
+});
+
+// /reload
+bot.onText(/\/reload/, async (msg) => {
+    if (!isAllowed(msg)) return unauthorized(msg);
+
+    const statusMsg = await bot.sendMessage(msg.chat.id, '⏳ Đang reload data từ Google Sheet...');
+
+    try {
+        const count = await loadWallets();
+        bot.editMessageText(`✅ Reload thành công! <b>${count}</b> wallets loaded.`, {
+            chat_id: msg.chat.id,
+            message_id: statusMsg.message_id,
+            parse_mode: 'HTML'
+        });
+    } catch (e) {
+        bot.editMessageText(`❌ Reload thất bại: ${escapeHtml(e.message)}`, {
+            chat_id: msg.chat.id,
+            message_id: statusMsg.message_id,
+            parse_mode: 'HTML'
+        });
+    }
 });
 
 // /search <query>
@@ -199,41 +261,45 @@ bot.onText(/\/search\s+(.+)/, (msg, match) => {
 
     const query = match[1].trim();
     const results = searchWallets(query);
-    const text = formatResults(query, results);
-
-    bot.sendMessage(msg.chat.id, text, { parse_mode: 'HTML' });
+    bot.sendMessage(msg.chat.id, formatResults(query, results), { parse_mode: 'HTML' });
 });
 
-// Any text message → auto-detect address lookup or label search
+// Any text → auto-detect address or search
 bot.on('message', (msg) => {
     if (!msg.text) return;
-    if (msg.text.startsWith('/')) return; // skip commands
+    if (msg.text.startsWith('/')) return;
     if (!isAllowed(msg)) return unauthorized(msg);
 
     const text = msg.text.trim();
     if (!text) return;
 
-    // Try exact address lookup first
+    // Exact address lookup
     if (isEvm(text) || isSol(text)) {
         const exact = lookupAddress(text);
         if (exact) {
             bot.sendMessage(msg.chat.id, formatExactMatch(exact), { parse_mode: 'HTML' });
-            return;
+        } else {
+            bot.sendMessage(msg.chat.id, `❌ Không tìm thấy.\n\n<code>${escapeHtml(text)}</code>`, { parse_mode: 'HTML' });
         }
-        // Address format but not found
-        bot.sendMessage(msg.chat.id, `❌ Address không có trong danh sách.\n\n<code>${escapeHtml(text)}</code>`, { parse_mode: 'HTML' });
         return;
     }
 
-    // Otherwise: search by label or partial address
+    // Search by label or partial address
     const results = searchWallets(text);
-    const output = formatResults(text, results);
-    bot.sendMessage(msg.chat.id, output, { parse_mode: 'HTML' });
+    bot.sendMessage(msg.chat.id, formatResults(text, results), { parse_mode: 'HTML' });
 });
 
-// Error handling
 bot.on('polling_error', (err) => {
     console.error('Polling error:', err.code, err.message);
 });
 
-console.log('🤖 Wallet Lookup Bot is running...');
+// ===================== STARTUP =====================
+(async () => {
+    try {
+        await loadWallets();
+        console.log('🤖 Wallet Lookup Bot is running...');
+    } catch (e) {
+        console.error('⚠️ Bot started but wallet data failed to load. Use /reload to retry.');
+        console.log('🤖 Wallet Lookup Bot is running (no data)...');
+    }
+})();
